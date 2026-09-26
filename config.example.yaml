@@ -1,0 +1,66 @@
+# Example study configuration. Everything here is fictional: replace the persona,
+# household and runs with your own. Copy to config.yaml (or pass --config).
+
+study:
+  name: example-study
+  data_root: ./data            # every output lands under here (relative to this file)
+
+server:
+  url: http://127.0.0.1:8080   # the PATCHED llama-server (see patches/); PEV_SERVER_URL overrides
+
+persona:
+  name: Ava                    # the persona whose model is studied (narrates in the first person)
+  noun: woman                  # for bare-names prompts: "a woman named Ava, who narrates in the first person"
+  pronoun: she                 # he / she / they
+  scaffold: examples/scaffold.example.json   # your frozen identity prompt, containing the slots {{RULES}} and {{TASK}}
+  scaffold_format: json        # json: slots sit inside JSON strings and are filled escaped; text: filled verbatim
+  # scaffold_system: "Take on the identity ... you are {persona}. ..."   # system message for chat-template runs given the scaffold
+
+# The real people in the persona's life. Each gets a cast "self_<key>": the persona with that person.
+# `gloss` is optional extra wording in the task text ("yourself and Robin, your oldest friend").
+# `control` pairs the person with a gender-matched invented companion for the held-out probe.
+household:
+  - {key: sam,   name: Sam,   noun: man,   pronoun: he,  gloss: "",                control: man}
+  - {key: robin, name: Robin, noun: woman, pronoun: she, gloss: "your oldest friend", control: woman}
+  - {key: kit,   name: Kit,   noun: woman, pronoun: she, gloss: "",                control: woman}
+
+# Invented companions (named controls). Keep them unremarkable and absent from the persona's data.
+invented_controls:
+  woman: Clara
+  man: Daniel
+
+# Casts in which the persona is absent and a household member feels the emotion:
+#   with: stranger -> "stranger_<bearer>";  with: <key> -> "<key>_<bearer>"
+absent_casts:
+  - {bearer: sam, with: stranger}
+  - {bearer: sam, with: kit}
+
+# Optional: override the task-side prompt templates (defaults in pev/lab.py) to suit your persona.
+# prompts:
+#   rules: "..."            # constant writing-task rules, filled into {{RULES}}
+#   rules_neutral: "..."
+#   task: "Brief. Characters: {cast}. Premise: {topic}. Perspective: {perspective}. {feel}: {emotion}. ..."
+#   task_neutral: "..."
+
+generation:
+  premises: 40                 # premises per (emotion, cast) cell; the list is in pev/lab.py
+  capture_skip: 24             # leading generated tokens excluded from the mean (JSON preamble)
+  n_predict: 700               # token cap; capped stories are retried once, then excluded
+  plan_seed: 1234
+  sampling: {temperature: 1.0, top_p: 0.9, top_k: 40, min_p: 0.05, repeat_penalty: 1.1}
+
+# The configurations to compare. `architecture` groups runs that share a residual basis.
+#   persona      the persona model with its scaffold, in its deployment format
+#   base+prompt  the untouched base model given the same scaffold
+#   base+names   the untouched base model given only the characters' names (the null test)
+# fmt: flat = filled scaffold + `marker` with no chat template (for a fine-tune trained on raw text; set
+#      `marker` to the separator it was trained to answer after); chat = the server's chat template.
+# model_match: a substring of the served model path, checked before generating (optional).
+runs:
+  - {name: A-persona,     label: A-Persona,     architecture: A, condition: persona,     fmt: flat,
+     marker: "\n\nAnswer:\n", stop: ["<eos>"], model_match: ""}
+  - {name: A-base-prompt, label: A-Base+Prompt, architecture: A, condition: base+prompt, fmt: chat, stop: [], model_match: ""}
+  - {name: A-base-names,  label: A-Base+Names,  architecture: A, condition: base+names,  fmt: chat, stop: [], model_match: ""}
+  # Optional per run:
+  #   analysis_layer: 20                      # default round(2/3 * n_layers)
+  #   apply_template_extra: {chat_template_kwargs: {enable_thinking: false}}

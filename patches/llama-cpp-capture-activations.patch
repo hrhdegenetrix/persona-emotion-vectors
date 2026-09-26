@@ -1,0 +1,989 @@
+llama.cpp patch: per-request activation capture and additive steering for llama-server
+=====================================================================================
+
+Base: ggml-org/llama.cpp commit 9a286ac98d2cab74231bd3f1fc3f2b8bdf05422e
+      ("docs: improve Windows build instructions (#27381)", 2026-08-21).
+Apply: git checkout 9a286ac98d2cab74231bd3f1fc3f2b8bdf05422e && git apply llama-cpp-capture-activations.patch
+It may need small manual fixes on later upstream revisions (server files change often).
+
+Adds to tools/server (see patches/README.md for the API):
+  * activation_capture.h — an eval callback on the per-layer residual output ("l_out-N" /
+    "final_output-N"): live per-layer means (GET/POST /activations), per-token collection to a
+    binary file (POST /activations/collect, optional FFN-intermediate tensor), projection
+    write-back steering and additive steering (POST /activations/steer), and per-request
+    accumulation of the mean residual vector over a completion's decoded tokens.
+  * /completion fields: capture_activations, capture_skip, capture_layers -> the final result
+    carries "activation_means". Requires -np 1; refused under speculative decoding.
+  * src/llama-context.cpp: set the eval callback on every ubatch (also when a graph is reused).
+  * LLAMA_NO_ACTIVATION_CAPTURE=1 disables the callback registration entirely.
+
+Everything is off by default; with capture disabled the callback declines every tensor.
+The endpoints are unauthenticated and /activations/collect and /activations/steer read or write
+server-side file paths: bind the server to 127.0.0.1.
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 52f8d5367..571bb0f04 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1336,6 +1336,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
++    // Always set eval callback (even on graph reuse) so activation capture works
++    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++
+     if (!graph_reuse_disable && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+@@ -1351,7 +1354,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+diff --git a/tools/server/activation_capture.h b/tools/server/activation_capture.h
+new file mode 100644
+index 000000000..538d07c07
+--- /dev/null
++++ b/tools/server/activation_capture.h
+@@ -0,0 +1,462 @@
++#pragma once
++
++// Activation capture for llama-server feature transparency
++// Hooks into ggml's eval callback to capture l_out tensors during inference
++//
++// Two modes:
++//   1. Live monitoring — stores per-layer mean activations in memory (original)
++//   2. Collection — streams per-token full activation vectors to a binary file for SAE training
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <mutex>
++#include <vector>
++#include <string>
++#include <map>
++#include <cstring>
++#include <cstdio>
++#include <chrono>
++#include <algorithm>
++#include <cmath>
++
++// Binary file format for collected activations:
++//   Header (16 bytes):
++//     magic:      "ACTV" (4 bytes)
++//     version:    uint32_t = 1
++//     n_embd:     uint32_t
++//     layer_idx:  uint32_t
++//   Records (repeated, no delimiter):
++//     float32[n_embd]  — one per token
++//
++// Read with numpy: np.fromfile(f, dtype=np.float32, offset=16).reshape(-1, n_embd)
++
++struct activation_capture {
++    std::mutex mtx;
++    bool enabled = false;
++    int n_layers = 0;
++    int n_embd = 0;
++
++    // --- Live monitoring mode ---
++    // Per-layer mean activations from the most recent decode
++    // layer_means[il] has size n_embd (mean across all tokens in the batch)
++    std::vector<std::vector<float>> layer_means;
++
++    // Timestamp of last capture (milliseconds since epoch)
++    int64_t last_capture_ms = 0;
++
++    // Number of tokens in the last captured batch
++    int last_n_tokens = 0;
++
++    // --- Collection mode (SAE training / FFN-intermediate extraction) ---
++    bool collecting = false;
++    int collect_layer = -1;         // which layer to collect from (-1 = none)
++    FILE * collect_file = nullptr;  // output file handle
++    int64_t collect_n_tokens = 0;   // total tokens written so far
++    std::string collect_tensor = ""; // tensor prefix to collect (empty = l_out, "ffn_swiglu" = FFN intermediate)
++    int collect_dim = 0;            // dimension of collected tensor (set from first captured tensor)
++
++    void init(int layers, int embd) {
++        std::lock_guard<std::mutex> lock(mtx);
++        n_layers = layers;
++        n_embd = embd;
++        layer_means.clear();
++        layer_means.resize(layers);
++    }
++
++    void store_layer_mean(int il, const float * data, int n_embd_actual, int n_tokens) {
++        if (il < 0 || il >= n_layers) return;
++
++        std::vector<float> mean(n_embd_actual, 0.0f);
++
++        // Mean across all tokens for this layer
++        for (int t = 0; t < n_tokens; t++) {
++            for (int j = 0; j < n_embd_actual; j++) {
++                mean[j] += data[t * n_embd_actual + j];
++            }
++        }
++        if (n_tokens > 0) {
++            for (int j = 0; j < n_embd_actual; j++) {
++                mean[j] /= (float)n_tokens;
++            }
++        }
++
++        std::lock_guard<std::mutex> lock(mtx);
++        layer_means[il] = std::move(mean);
++        last_n_tokens = n_tokens;
++
++        auto now = std::chrono::system_clock::now();
++        last_capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++            now.time_since_epoch()).count();
++    }
++
++    // Write per-token vectors to the collection file (called from callback)
++    void collect_tokens(int il, const float * data, int n_embd_actual, int n_tokens) {
++        if (il != collect_layer || !collect_file) return;
++
++        // Write raw float32 vectors — one per token, no framing
++        size_t written = fwrite(data, sizeof(float), (size_t)n_embd_actual * n_tokens, collect_file);
++        if (written == (size_t)n_embd_actual * n_tokens) {
++            collect_n_tokens += n_tokens;
++        }
++        // Flush periodically (every ~1000 tokens) to avoid data loss
++        if (collect_n_tokens % 1024 < n_tokens) {
++            fflush(collect_file);
++        }
++    }
++
++    // ---- Projection write-back steering ----
++    // Per-layer projection matrices: for target layer il, steer_dirs[il] holds
++    // K unit row-directions (each n_embd long, flattened K*n_embd). At decode
++    // time each token vector h has its component along those directions
++    // attenuated:  h' = h - steer_alpha * sum_k (dir_k . h) dir_k
++    // (subtract a chosen subspace). Optionally add world_dirs
++    // back at a small positive scale. This is a per-token subspace edit, not a
++    // static vector add.
++    bool steering = false;
++    float steer_alpha = 0.0f;
++    float world_beta  = 0.0f;
++    int   steer_only_ntok1 = 1;   // 1 = only edit single-token decode steps (skip prefill)
++    std::map<int, std::vector<float>> steer_dirs;   // il -> K*n_embd subspace dirs
++    std::map<int, int>                steer_k;      // il -> K
++    std::map<int, std::vector<float>> world_dirs;   // il -> M*n_embd world dirs
++    std::map<int, int>                world_m;      // il -> M
++
++    // Edit one batch's token buffer in place (data is [n_embd, n_tokens] row-major
++    // as [token][embd]). Called from the callback for target layers only.
++    bool apply_steer(int il, float * data, int dim, int n_tokens) {
++        if (!steering) return false;
++        auto it = steer_dirs.find(il);
++        if (it == steer_dirs.end() || dim != n_embd) return false;
++        const int K = steer_k[il];
++        const float * D = it->second.data();
++        const bool has_world = world_dirs.count(il) && world_beta != 0.0f;
++        const int M = has_world ? world_m[il] : 0;
++        const float * W = has_world ? world_dirs[il].data() : nullptr;
++        for (int t = 0; t < n_tokens; t++) {
++            float * h = data + (size_t)t * dim;
++            for (int k = 0; k < K; k++) {
++                const float * dk = D + (size_t)k * dim;
++                float dot = 0.0f;
++                for (int j = 0; j < dim; j++) dot += dk[j] * h[j];
++                const float s = steer_alpha * dot;
++                for (int j = 0; j < dim; j++) h[j] -= s * dk[j];
++            }
++            for (int m = 0; m < M; m++) {
++                const float * wm = W + (size_t)m * dim;
++                float dot = 0.0f;
++                for (int j = 0; j < dim; j++) dot += wm[j] * h[j];
++                // pull toward world subspace: add a fraction of its own unit dir
++                for (int j = 0; j < dim; j++) h[j] += world_beta * wm[j];
++                (void)dot;
++            }
++        }
++        return true;
++    }
++
++    void set_steer_layer(int il, const float * dirs, int K, const float * wdirs, int M) {
++        std::lock_guard<std::mutex> lock(mtx);
++        if (K > 0 && dirs) {
++            steer_dirs[il] = std::vector<float>(dirs, dirs + (size_t)K * n_embd);
++            steer_k[il] = K;
++        }
++        if (M > 0 && wdirs) {
++            world_dirs[il] = std::vector<float>(wdirs, wdirs + (size_t)M * n_embd);
++            world_m[il] = M;
++        }
++    }
++
++    void clear_steering() {
++        std::lock_guard<std::mutex> lock(mtx);
++        steering = false; steer_alpha = 0.0f; world_beta = 0.0f;
++        steer_dirs.clear(); steer_k.clear(); world_dirs.clear(); world_m.clear();
++    }
++
++    // ---- Additive steering ----
++    // h' = h + add_vecs[il]  (vectors arrive pre-scaled by the client; the
++    // paper's convention is strength * mean residual norm at that layer).
++    // Independent of the projection mode above; both may be active.
++    bool add_active = false;
++    int  add_only_decode = 1;                         // 1 = decode steps only (skip prefill)
++    std::map<int, std::vector<float>> add_vecs;       // il -> n_embd
++
++    void set_add_layer(int il, const float * v) {
++        std::lock_guard<std::mutex> lock(mtx);
++        add_vecs[il] = std::vector<float>(v, v + n_embd);
++    }
++    void clear_add() {
++        std::lock_guard<std::mutex> lock(mtx);
++        add_active = false; add_vecs.clear();
++    }
++    bool apply_add(int il, float * data, int dim, int n_tokens) {
++        if (!add_active || dim != n_embd) return false;
++        auto it = add_vecs.find(il);
++        if (it == add_vecs.end()) return false;
++        const float * v = it->second.data();
++        for (int t = 0; t < n_tokens; t++) {
++            float * h = data + (size_t)t * dim;
++            for (int j = 0; j < dim; j++) h[j] += v[j];
++        }
++        return true;
++    }
++
++    // ---- Per-response accumulation ----
++    // Mean residual-stream vector over the DECODED tokens of one request,
++    // per layer, optionally skipping the first `acc_skip` tokens (the paper
++    // averages from the 50th story token). Begun when the slot enters
++    // SLOT_STATE_GENERATING and ended in send_final_response, so the result
++    // rides back inside that request's own JSON — no cross-request race.
++    // Global accumulator: only meaningful with -np 1 (the server refuses it
++    // otherwise). Sums in double.
++    bool acc_active = false;
++    bool acc_prev_enabled = false;
++    int  acc_skip = 0;
++    std::vector<char>                acc_layer_on;   // n_layers flags
++    std::vector<std::vector<double>> acc_sums;       // n_layers x n_embd (empty until touched)
++    std::vector<int64_t>             acc_count;      // tokens accumulated per layer (after skip)
++    std::vector<int64_t>             acc_seen;       // decode tokens seen per layer (incl. skipped)
++
++    void acc_begin(int skip, const std::vector<int> & layers) {
++        std::lock_guard<std::mutex> lock(mtx);
++        acc_skip = skip < 0 ? 0 : skip;
++        acc_layer_on.assign(n_layers, layers.empty() ? 1 : 0);
++        for (int il : layers) if (il >= 0 && il < n_layers) acc_layer_on[il] = 1;
++        acc_sums.assign(n_layers, std::vector<double>());
++        acc_count.assign(n_layers, 0);
++        acc_seen.assign(n_layers, 0);
++        acc_prev_enabled = enabled;
++        enabled = true;      // the eval callback only observes l_out while enabled
++        acc_active = true;
++    }
++
++    // called from the callback for decode batches only (n_tokens == 1 normally;
++    // accepted multi-token drafts are averaged token by token)
++    void acc_add(int il, const float * data, int dim, int n_tokens) {
++        if (!acc_active || il < 0 || il >= n_layers || dim != n_embd) return;
++        if (!acc_layer_on[il]) return;
++        std::lock_guard<std::mutex> lock(mtx);
++        auto & sum = acc_sums[il];
++        for (int t = 0; t < n_tokens; t++) {
++            const int64_t seen = acc_seen[il]++;
++            if (seen < acc_skip) continue;
++            if (sum.empty()) sum.assign(dim, 0.0);
++            const float * h = data + (size_t)t * dim;
++            for (int j = 0; j < dim; j++) sum[j] += h[j];
++            acc_count[il]++;
++        }
++    }
++
++    // Returns {"n_layers", "n_embd", "skip", "n_tokens_seen", "n_tokens_used",
++    //          "layers": { "<il>": [mean floats...] }} and stops accumulating.
++    // Layers whose count is 0 (all tokens skipped) are omitted.
++    template <typename JSON>
++    JSON acc_end() {
++        std::lock_guard<std::mutex> lock(mtx);
++        JSON out;
++        out["n_layers"] = n_layers;
++        out["n_embd"]   = n_embd;
++        out["skip"]     = acc_skip;
++        int64_t seen = 0, used = 0;
++        JSON layers = JSON::object();
++        for (int il = 0; il < n_layers; il++) {
++            if (!acc_layer_on.empty() && !acc_layer_on[il]) continue;
++            seen = std::max(seen, acc_seen[il]);
++            used = std::max(used, acc_count[il]);
++            if (acc_count[il] <= 0 || acc_sums[il].empty()) continue;
++            std::vector<float> mean(n_embd);
++            const double inv = 1.0 / (double) acc_count[il];
++            for (int j = 0; j < n_embd; j++) mean[j] = (float)(acc_sums[il][j] * inv);
++            layers[std::to_string(il)] = mean;
++        }
++        out["n_tokens_seen"] = seen;
++        out["n_tokens_used"] = used;
++        out["layers"] = layers;
++        acc_active = false;
++        enabled = acc_prev_enabled;
++        acc_sums.clear(); acc_count.clear(); acc_seen.clear(); acc_layer_on.clear();
++        return out;
++    }
++
++    bool start_collection(int layer, const char * path, const char * tensor = nullptr) {
++        std::lock_guard<std::mutex> lock(mtx);
++        if (collecting) return false; // already collecting
++
++        if (layer < 0 || layer >= n_layers) return false;
++
++        FILE * f = fopen(path, "wb");
++        if (!f) return false;
++
++        // Determine dimension based on tensor type
++        // For FFN intermediates, dim is set from the first captured tensor (written as 0 initially, patched later)
++        // For l_out, dim is n_embd
++        bool is_ffn = (tensor && strlen(tensor) > 0);
++        uint32_t dim = is_ffn ? 0 : (uint32_t)n_embd;
++
++        // Write header
++        const char magic[4] = {'A', 'C', 'T', 'V'};
++        uint32_t version = 1;
++        uint32_t lidx = (uint32_t)layer;
++
++        fwrite(magic, 1, 4, f);
++        fwrite(&version, sizeof(uint32_t), 1, f);
++        fwrite(&dim, sizeof(uint32_t), 1, f);
++        fwrite(&lidx, sizeof(uint32_t), 1, f);
++
++        collect_file = f;
++        collect_layer = layer;
++        collect_n_tokens = 0;
++        collect_tensor = tensor ? tensor : "";
++        collect_dim = 0;
++        collecting = true;
++        // Also ensure capture is enabled so callback fires
++        enabled = true;
++
++        return true;
++    }
++
++    // Patch the binary header with correct dimension (called after first tensor capture for FFN mode)
++    void patch_header_dim(int dim) {
++        if (!collect_file) return;
++        long pos = ftell(collect_file);
++        fseek(collect_file, 8, SEEK_SET); // offset 8 = n_embd field
++        uint32_t d = (uint32_t)dim;
++        fwrite(&d, sizeof(uint32_t), 1, collect_file);
++        fseek(collect_file, pos, SEEK_SET);
++    }
++
++    bool stop_collection() {
++        std::lock_guard<std::mutex> lock(mtx);
++        if (!collecting) return false;
++
++        if (collect_file) {
++            fflush(collect_file);
++            fclose(collect_file);
++            collect_file = nullptr;
++        }
++        collecting = false;
++        collect_layer = -1;
++        return true;
++    }
++};
++
++// Global instance
++inline activation_capture g_activation_capture;
++
++// The eval callback — called for every tensor node during graph computation
++// When ask==true: return true if we want to observe this tensor (causes GPU->CPU copy)
++// When ask==false: tensor data is available for reading
++static bool activation_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
++    (void)user_data;
++
++    // We care about layer output tensors — named differently by model architecture:
++    //   Most architectures:                        "l_out-{layer}"
++    //   Some newer architectures:                  "final_output-{layer}"
++    const bool is_lout = strncmp(t->name, "l_out", 5) == 0
++                       || strncmp(t->name, "final_output", 12) == 0;
++
++    // Check if this tensor matches the collection target (e.g., "ffn_swiglu-{layer}")
++    bool is_collect_target = false;
++    if (g_activation_capture.collecting && !g_activation_capture.collect_tensor.empty()) {
++        is_collect_target = strncmp(t->name, g_activation_capture.collect_tensor.c_str(),
++                                    g_activation_capture.collect_tensor.length()) == 0;
++    }
++
++    if (ask) {
++        // Steering needs the l_out tensor even when capture is disabled, so
++        // ask for it whenever steering targets this layer.
++        if ((g_activation_capture.steering || g_activation_capture.add_active) && is_lout) {
++            int il_a = -1;
++            const char * d = strchr(t->name, '-');
++            if (d) il_a = atoi(d + 1);
++            if (il_a >= 0 && ((g_activation_capture.steering && g_activation_capture.steer_dirs.count(il_a))
++                           || (g_activation_capture.add_active && g_activation_capture.add_vecs.count(il_a)))) {
++                return true;
++            }
++        }
++        if (!g_activation_capture.enabled) {
++            return false;
++        }
++        // Live monitoring only consumes decode-step activations (the stored
++        // state after a response is always the last generated token), so skip
++        // prompt-processing batches (n_tokens > 1) — every observed tensor is
++        // a graph split + GPU->CPU sync, and declining here keeps prefill
++        // fully fused. Collection mode still observes everything: SAE-style
++        // collection reads prompt-token activations too.
++        if (!g_activation_capture.collecting && t->ne[1] > 1) {
++            return false;
++        }
++        return is_lout || is_collect_target;
++    }
++
++    // ask == false: tensor data has been copied to CPU for us to read
++    if (!is_lout && !is_collect_target) {
++        return true;
++    }
++
++    // Parse layer index from tensor name: "l_out-0", "ffn_swiglu-31", etc.
++    int il = -1;
++    const char * dash = strchr(t->name, '-');
++    if (dash) {
++        il = atoi(dash + 1);
++    }
++    if (il < 0) {
++        return true;
++    }
++
++    if (t->type != GGML_TYPE_F32) {
++        return true;
++    }
++
++    // t is [dim, n_tokens] — dim is n_embd for l_out, n_ff for FFN intermediates
++    int dim      = (int)t->ne[0];
++    int n_tokens = (int)t->ne[1];
++    size_t n_bytes = (size_t)dim * n_tokens * sizeof(float);
++
++    std::vector<float> cpu_buf(dim * n_tokens);
++    ggml_backend_tensor_get(t, cpu_buf.data(), 0, n_bytes);
++
++    // Projection write-back steering: edit the residual in place and push it back
++    // to the backend buffer so downstream layers see the edited state. Only
++    // for l_out (the residual stream) at target layers; skip prefill batches
++    // unless explicitly enabled.
++    if (is_lout && g_activation_capture.steering && g_activation_capture.steer_dirs.count(il)) {
++        if (!(g_activation_capture.steer_only_ntok1 && n_tokens > 1)) {
++            if (g_activation_capture.apply_steer(il, cpu_buf.data(), dim, n_tokens)) {
++                ggml_backend_tensor_set(t, cpu_buf.data(), 0, n_bytes);
++            }
++        }
++    }
++
++    // Additive steering: h += v at target layers, written back
++    if (is_lout && g_activation_capture.add_active && g_activation_capture.add_vecs.count(il)) {
++        if (!(g_activation_capture.add_only_decode && n_tokens > 1)) {
++            if (g_activation_capture.apply_add(il, cpu_buf.data(), dim, n_tokens)) {
++                ggml_backend_tensor_set(t, cpu_buf.data(), 0, n_bytes);
++            }
++        }
++    }
++
++    // Update live monitoring means for l_out tensors only
++    if (is_lout) {
++        g_activation_capture.store_layer_mean(il, cpu_buf.data(), dim, n_tokens);
++        // Per-response accumulation: decode batches only (prefill n_tokens>1 is
++        // declined in the ask phase unless collecting; guard again here).
++        if (g_activation_capture.acc_active && n_tokens == 1) {
++            g_activation_capture.acc_add(il, cpu_buf.data(), dim, n_tokens);
++        }
++    }
++
++    // Stream to collection file if this tensor matches the collection target
++    if (g_activation_capture.collecting && (is_collect_target || (is_lout && g_activation_capture.collect_tensor.empty()))) {
++        // Patch header with actual dimension on first capture
++        if (g_activation_capture.collect_dim == 0 && dim > 0) {
++            g_activation_capture.collect_dim = dim;
++            if (is_collect_target) {
++                g_activation_capture.patch_header_dim(dim);
++            }
++        }
++        g_activation_capture.collect_tokens(il, cpu_buf.data(), dim, n_tokens);
++    }
++
++    return true;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1293c8640..4af45346f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,3 +1,4 @@
++#include "activation_capture.h"
+ #include "server-context.h"
+ #include "server-chat.h"
+ #include "server-common.h"
+@@ -1103,6 +1104,16 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        // Activation capture: install eval callback before context creation.
++        // A registered cb_eval forces node-by-node graph evaluation (disables CUDA
++        // graphs and backend fusion), so LLAMA_NO_ACTIVATION_CAPTURE=1 skips
++        // registration entirely for capture-free deployments.
++        const char * no_capture = getenv("LLAMA_NO_ACTIVATION_CAPTURE");
++        if (no_capture == nullptr || strcmp(no_capture, "1") != 0) {
++            params_base.cb_eval = activation_eval_callback;
++            params_base.cb_eval_user_data = nullptr;
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
+         model_tgt = llama_init->model();
+@@ -1122,6 +1133,14 @@ private:
+ 
+         n_ctx = llama_n_ctx(ctx_tgt);
+ 
++        // Activation capture: init struct with model dimensions
++        {
++            int act_n_layers = llama_model_n_layer(model_tgt);
++            int act_n_embd   = llama_model_n_embd(model_tgt);
++            g_activation_capture.init(act_n_layers, act_n_embd);
++            SRV_INF("activation capture: initialized (%d layers, %d embd)%s\n", act_n_layers, act_n_embd, "");
++        }
++
+         add_bos_token = llama_vocab_get_add_bos(vocab);
+ 
+         if (has_spec) {
+@@ -2067,6 +2086,16 @@ private:
+         res->stop                  = slot.stop;
+         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+ 
++        if (slot.task->params.capture_activations) {
++            if (params_base.n_parallel != 1) {
++                res->activation_means = json{{"error", "capture_activations requires -np 1 (global accumulator)"}};
++            } else if (slot.can_speculate()) {
++                res->activation_means = json{{"error", "capture_activations is unavailable with speculative/MTP decoding (draft batches mix rejected tokens)"}};
++            } else {
++                res->activation_means = g_activation_capture.acc_end<json>();
++            }
++        }
++
+         res->verbose           = slot.task->params.verbose;
+         res->stream            = slot.task->params.stream;
+         res->include_usage     = slot.task->params.include_usage;
+@@ -3766,6 +3795,13 @@ private:
+                 // prompt evaluated for next-token prediction
+                 slot.state = SLOT_STATE_GENERATING;
+ 
++                // per-response activation accumulation starts with the first decode step.
++                // Speculative/MTP decoding verifies draft tokens in multi-token batches whose
++                // rejected rows can't be told apart in the eval callback, so refuse it there.
++                if (slot.task->params.capture_activations && params_base.n_parallel == 1 && !slot.can_speculate()) {
++                    g_activation_capture.acc_begin(slot.task->params.capture_skip, slot.task->params.capture_layers);
++                }
++
+                 if (slot.can_speculate()) {
+                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                 }
+@@ -5202,6 +5238,294 @@ void server_routes::init_routes() {
+         res->ok(result->to_json());
+         return res;
+     };
++
++    // --- Activation capture: GET /activations ---
++    this->get_activations = [](const server_http_req & req) -> server_http_res_ptr {
++        auto res = std::make_unique<server_http_res>();
++        json result;
++
++        std::lock_guard<std::mutex> lock(g_activation_capture.mtx);
++        result["enabled"]          = g_activation_capture.enabled;
++        result["n_layers"]         = g_activation_capture.n_layers;
++        result["n_embd"]           = g_activation_capture.n_embd;
++        result["last_capture_ms"]  = g_activation_capture.last_capture_ms;
++        result["last_n_tokens"]    = g_activation_capture.last_n_tokens;
++        result["collecting"]       = g_activation_capture.collecting;
++        result["collect_layer"]    = g_activation_capture.collect_layer;
++        result["collect_n_tokens"] = g_activation_capture.collect_n_tokens;
++
++        // Parse optional query params
++        std::string layers_param = req.get_param("layers");
++        std::string top_k_param  = req.get_param("top_k");
++        int top_k = top_k_param.empty() ? 0 : std::stoi(top_k_param);
++
++        // Determine which layers to return
++        std::vector<int> requested_layers;
++        if (!layers_param.empty()) {
++            std::stringstream ss(layers_param);
++            std::string item;
++            while (std::getline(ss, item, ',')) {
++                int il = std::stoi(item);
++                if (il >= 0 && il < g_activation_capture.n_layers) {
++                    requested_layers.push_back(il);
++                }
++            }
++        } else {
++            for (int i = 0; i < g_activation_capture.n_layers; i++) {
++                requested_layers.push_back(i);
++            }
++        }
++
++        if (top_k > 0) {
++            // Return only top-K activations by magnitude per layer
++            json layers_obj = json::object();
++            for (int il : requested_layers) {
++                json layer_data;
++                if (il < (int)g_activation_capture.layer_means.size() &&
++                    !g_activation_capture.layer_means[il].empty()) {
++                    const auto & means = g_activation_capture.layer_means[il];
++                    int n = (int)means.size();
++                    std::vector<std::pair<int, float>> indexed(n);
++                    for (int j = 0; j < n; j++) {
++                        indexed[j] = {j, means[j]};
++                    }
++                    std::partial_sort(indexed.begin(),
++                                      indexed.begin() + std::min(top_k, n),
++                                      indexed.end(),
++                                      [](const auto & a, const auto & b) {
++                                          return std::abs(a.second) > std::abs(b.second);
++                                      });
++                    json top_arr = json::array();
++                    for (int j = 0; j < std::min(top_k, n); j++) {
++                        top_arr.push_back({{"idx", indexed[j].first}, {"val", indexed[j].second}});
++                    }
++                    layer_data["top_k"] = top_arr;
++                } else {
++                    layer_data["top_k"] = json::array();
++                }
++                layers_obj[std::to_string(il)] = layer_data;
++            }
++            result["layers"] = layers_obj;
++        } else {
++            // Return full mean vectors
++            json layer_means = json::array();
++            for (int il : requested_layers) {
++                if (il < (int)g_activation_capture.layer_means.size() &&
++                    !g_activation_capture.layer_means[il].empty()) {
++                    layer_means.push_back(g_activation_capture.layer_means[il]);
++                } else {
++                    layer_means.push_back(json::array());
++                }
++            }
++            result["layer_means"] = layer_means;
++        }
++
++        res->data = result.dump();
++        return res;
++    };
++
++    // --- Activation capture: POST /activations ---
++    this->post_activations = [](const server_http_req & req) -> server_http_res_ptr {
++        auto res = std::make_unique<server_http_res>();
++        json body;
++        try {
++            body = json::parse(req.body);
++        } catch (...) {
++            res->status = 400;
++            res->data = json({{"error", "invalid JSON"}}).dump();
++            return res;
++        }
++
++        bool want_enabled = body.value("enabled", false);
++        {
++            std::lock_guard<std::mutex> lock(g_activation_capture.mtx);
++            g_activation_capture.enabled = want_enabled;
++        }
++
++        json result;
++        result["enabled"]  = want_enabled;
++        result["n_layers"] = g_activation_capture.n_layers;
++        result["n_embd"]   = g_activation_capture.n_embd;
++        res->data = result.dump();
++        return res;
++    };
++
++    // --- Activation capture: POST /activations/collect ---
++    // Start or stop per-token activation collection to a binary file (for SAE training)
++    // Start: {"layer": 17, "path": "/tmp/activations_layer17.bin"}
++    // Stop:  {"stop": true}
++    // Status: {} (empty body)
++    this->post_activations_collect = [](const server_http_req & req) -> server_http_res_ptr {
++        auto res = std::make_unique<server_http_res>();
++        json body;
++        try {
++            body = json::parse(req.body);
++        } catch (...) {
++            res->status = 400;
++            res->data = json({{"error", "invalid JSON"}}).dump();
++            return res;
++        }
++
++        json result;
++
++        if (body.contains("stop") && body["stop"].get<bool>()) {
++            // Stop collection
++            int64_t tokens_collected = g_activation_capture.collect_n_tokens;
++            bool stopped = g_activation_capture.stop_collection();
++            result["stopped"] = stopped;
++            result["tokens_collected"] = tokens_collected;
++        } else if (body.contains("layer") && body.contains("path")) {
++            // Start collection
++            // Optional "tensor" param: default="" (l_out), "ffn_swiglu" (FFN intermediate), etc.
++            int layer = body["layer"].get<int>();
++            std::string path = body["path"].get<std::string>();
++            const char * tensor = nullptr;
++            std::string tensor_str;
++            if (body.contains("tensor")) {
++                tensor_str = body["tensor"].get<std::string>();
++                tensor = tensor_str.c_str();
++            }
++            bool started = g_activation_capture.start_collection(layer, path.c_str(), tensor);
++            if (!started) {
++                res->status = 409;
++                result["error"] = "Collection already active or invalid layer/path";
++                result["collecting"] = g_activation_capture.collecting;
++                result["n_layers"] = g_activation_capture.n_layers;
++                res->data = result.dump();
++                return res;
++            }
++            result["started"] = true;
++            result["layer"] = layer;
++            result["path"] = path;
++            result["tensor"] = tensor_str;
++            result["n_embd"] = g_activation_capture.n_embd;
++        }
++
++        // Always include status
++        result["collecting"]       = g_activation_capture.collecting;
++        result["collect_layer"]    = g_activation_capture.collect_layer;
++        result["collect_n_tokens"] = g_activation_capture.collect_n_tokens;
++        result["enabled"]          = g_activation_capture.enabled;
++
++        res->data = result.dump();
++        return res;
++    };
++
++    // POST /activations/steer — projection write-back steering and additive steering.
++    // Body: { "enabled": bool, "alpha": float, "beta": float (world pull),
++    //         "only_decode": bool,
++    //         "layers": [ { "layer": int, "n_embd": int,
++    //                       "dirs_path": "<file of K*n_embd float32>", "k": int,
++    //                       "world_path": "<file M*n_embd float32>"(opt), "m": int } ] }
++    // Directions must be pre-normalized (unit rows). Clears then reloads.
++    this->post_activations_steer = [](const server_http_req & req) -> server_http_res_ptr {
++        auto res = std::make_unique<server_http_res>();
++        json body;
++        try { body = json::parse(req.body); }
++        catch (...) { res->status = 400; res->data = json({{"error","invalid JSON"}}).dump(); return res; }
++
++        json result;
++        if (body.value("clear", false)) {
++            g_activation_capture.clear_steering();
++            g_activation_capture.clear_add();
++            result["cleared"] = true;
++            res->data = result.dump();
++            return res;
++        }
++        if (body.value("clear_add", false)) {
++            g_activation_capture.clear_add();
++            result["cleared_add"] = true;
++            if (!body.contains("add") && !body.contains("layers")) {
++                result["steering"] = g_activation_capture.steering;   // projection mode untouched
++                res->data = result.dump();
++                return res;
++            }
++        }
++
++        // Additive steering: "add": [ {"layer": il, "scale": s,
++        //   "path": "<file of n_embd float32>" | "vector": [floats...] }, ... ]
++        // Vectors are multiplied by `scale` here and then ADDED to l_out at
++        // that layer on every decode step ("add_only_decode": false to also
++        // edit prefill). Replaces any previous entry for the same layer.
++        if (body.contains("add")) {
++            const int n_embd_a = g_activation_capture.n_embd;
++            int loaded_add = 0;
++            for (const auto & A : body["add"]) {
++                int il = A.value("layer", -1);
++                if (il < 0 || il >= g_activation_capture.n_layers) continue;
++                float scale = A.value("scale", 1.0f);
++                std::vector<float> v;
++                if (A.contains("vector") && A["vector"].is_array()) {
++                    v = A["vector"].get<std::vector<float>>();
++                } else if (A.contains("path")) {
++                    v.resize(n_embd_a);
++                    FILE * f = fopen(A["path"].get<std::string>().c_str(), "rb");
++                    if (!f) { v.clear(); } else {
++                        size_t got = fread(v.data(), sizeof(float), n_embd_a, f);
++                        fclose(f);
++                        if (got != (size_t) n_embd_a) v.clear();
++                    }
++                }
++                if ((int) v.size() != n_embd_a) {
++                    result["error"] = "add vector wrong size/unreadable at layer " + std::to_string(il);
++                    res->status = 400; res->data = result.dump(); return res;
++                }
++                for (auto & x : v) x *= scale;
++                g_activation_capture.set_add_layer(il, v.data());
++                loaded_add++;
++            }
++            g_activation_capture.add_only_decode = body.value("add_only_decode", true) ? 1 : 0;
++            g_activation_capture.add_active = body.value("add_enabled", true) && !g_activation_capture.add_vecs.empty();
++            result["add_layers_loaded"] = loaded_add;
++            result["add_active"] = g_activation_capture.add_active;
++            if (!body.contains("layers")) {
++                result["steering"] = g_activation_capture.steering;
++                res->data = result.dump();
++                return res;
++            }
++        }
++
++        auto read_floats = [](const std::string & path, size_t want) -> std::vector<float> {
++            std::vector<float> v(want);
++            FILE * f = fopen(path.c_str(), "rb");
++            if (!f) return {};
++            size_t got = fread(v.data(), sizeof(float), want, f);
++            fclose(f);
++            if (got != want) return {};
++            return v;
++        };
++
++        int loaded = 0;
++        const int n_embd = g_activation_capture.n_embd;
++        for (const auto & L : body.value("layers", json::array())) {
++            int il = L["layer"].get<int>();
++            int K  = L.value("k", 0);
++            int M  = L.value("m", 0);
++            std::vector<float> reg, world;
++            if (K > 0) {
++                reg = read_floats(L["dirs_path"].get<std::string>(), (size_t)K * n_embd);
++                if (reg.empty()) { result["error"] = "dirs_path read failed at layer " + std::to_string(il); res->status = 400; res->data = result.dump(); return res; }
++            }
++            if (M > 0 && L.contains("world_path")) {
++                world = read_floats(L["world_path"].get<std::string>(), (size_t)M * n_embd);
++            }
++            g_activation_capture.set_steer_layer(il, K>0?reg.data():nullptr, K,
++                                                 M>0&&!world.empty()?world.data():nullptr,
++                                                 world.empty()?0:M);
++            loaded++;
++        }
++        g_activation_capture.steer_alpha = body.value("alpha", 1.0f);
++        g_activation_capture.world_beta  = body.value("beta", 0.0f);
++        g_activation_capture.steer_only_ntok1 = body.value("only_decode", true) ? 1 : 0;
++        g_activation_capture.steering = body.value("enabled", true) && loaded > 0;
++
++        result["steering"] = g_activation_capture.steering;
++        result["layers_loaded"] = loaded;
++        result["alpha"] = g_activation_capture.steer_alpha;
++        result["beta"]  = g_activation_capture.world_beta;
++        res->data = result.dump();
++        return res;
++    };
+ }
+ 
+ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 764df0e08..af857df48 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "server-http.h"
++#include "activation_capture.h"
+ #include "server-task.h"
+ #include "server-queue.h"
+ 
+@@ -154,6 +155,10 @@ struct server_routes {
+     server_http_context::handler_t post_rerank;
+     server_http_context::handler_t get_lora_adapters;
+     server_http_context::handler_t post_lora_adapters;
++    server_http_context::handler_t get_activations;
++    server_http_context::handler_t post_activations;
++    server_http_context::handler_t post_activations_collect;
++    server_http_context::handler_t post_activations_steer;
+ 
+     // to be used in router mode
+     json get_model_info() const;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 5d7fa6ae6..4ce7e8a50 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -498,6 +498,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+             }
+         }));
+ 
++    add((new field_bool("capture_activations", params.capture_activations))
++        ->set_desc("Return 'activation_means' in the final result: the mean residual-stream vector per layer over this request's decoded tokens (requires -np 1)"));
++
++    add((new field_num("capture_skip", params.capture_skip))
++        ->set_desc("With capture_activations: number of leading decoded tokens to exclude from the mean (default 0)"));
++
++    add((new field_json("capture_layers"))
++        ->set_desc("With capture_activations: array of layer indices to return (default: all layers)")
++        ->set_handler([&](field_eval_context & ctx, const json & data) {
++            ctx.params.capture_layers.clear();
++            const auto & cl = data.at("capture_layers");
++            if (cl.is_array()) {
++                for (const auto & v : cl) {
++                    if (v.is_number_integer()) ctx.params.capture_layers.push_back(v.get<int>());
++                }
++            }
++        }));
++
+     add((new field_json("samplers"))
+         ->set_desc("The order in which samplers are applied. An array of sampler type names, or a single string of sampler chars")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 258cdcf8f..ff7b9c1b1 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -361,6 +361,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
+     if (!stream && !probs_output.empty()) {
+         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
+     }
++    if (!activation_means.is_null()) {
++        res["activation_means"] = activation_means;
++    }
+     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
+ }
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 25ff01512..8325f8e90 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -73,6 +73,13 @@ struct task_params {
+     std::vector<std::string> antiprompt;
+     std::vector<std::string> response_fields;
+ 
++    // per-response activation accumulation (see activation_capture.h):
++    // when set, the final result carries "activation_means" = mean residual
++    // vector per layer over the decoded tokens (after capture_skip tokens)
++    bool capture_activations = false;
++    int32_t capture_skip = 0;
++    std::vector<int> capture_layers;   // empty = all layers
++
+     bool timings_per_token   = false;
+     bool post_sampling_probs = false;
+ 
+@@ -340,6 +347,8 @@ struct server_task_result_cmpl_final : server_task_result {
+     std::vector<completion_token_output> probs_output;
+     std::vector<std::string>  response_fields;
+ 
++    json activation_means; // null unless params.capture_activations
++
+     task_params generation_params;
+ 
+     // response formatting
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 5fe2729ba..f85df4b86 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -269,6 +269,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     // LoRA adapters hotswap
+     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
+     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
++    // Activation capture (feature transparency + SAE collection)
++    ctx_http.get ("/activations",              ex_wrapper(routes.get_activations));
++    ctx_http.post("/activations",              ex_wrapper(routes.post_activations));
++    ctx_http.post("/activations/collect",      ex_wrapper(routes.post_activations_collect));
++    ctx_http.post("/activations/steer",        ex_wrapper(routes.post_activations_steer));
+     // Save & load slots
+     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
+     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));

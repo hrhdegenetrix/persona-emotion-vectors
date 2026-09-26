@@ -1,0 +1,5 @@
+# study outputs: generated stories name real people; keep them out of version control
+data/
+config.yaml
+__pycache__/
+*.pyc
